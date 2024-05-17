@@ -1,0 +1,562 @@
+
+runAnalysis <- function() {
+
+    masterData <- createMasterData()
+
+    projectionData <- createProjections(masterData)
+
+}
+
+
+
+createMasterData <- function() {
+
+    ## this starts from scratch
+    ## loads the appropriate baseball libraries
+    ## joins them together and builds it in a dataframe called completeInputData
+    ## that data is manipulated to create a "netBasesCreated" stat for every offensive player
+    ## that gets output as a dataframe called "masterData"
+    ## for the time being it's contsrained to start after 1994
+
+    install.packages("Lahman")
+    install.packages("tidyverse")
+    library(Lahman)
+    library(tidyverse)
+
+    playerInfo <- (Lahman::People) 
+    
+    parkInfo <- (Lahman::Teams) %>%
+        filter(yearID > 1994) %>%
+        select(yearID,teamID,BPF)
+
+    playerInfoAndStats <- inner_join(battingStats(data = Lahman::Batting, idvars = c("playerID", "yearID"),cbind = TRUE),playerInfo) %>%
+        filter(yearID > 1994) %>%
+        filter(PA>1) %>%
+        select(playerID, yearID, teamID, birthYear,TB, BB,SB,SH,RBI,HBP,PA,H,GIDP,CS,SF)
+        
+    completeInputData <- inner_join(playerInfoAndStats,parkInfo) %>%
+        mutate(ballParkFactor = (BPF/100))%>%
+        select(playerID, yearID, teamID, birthYear,TB, BB,SB,SH,RBI,HBP,PA,H,GIDP,CS,SF, ballParkFactor)
+
+    masterData <- completeInputData %>%
+        group_by(yearID) %>%
+        mutate(leagueBasesToOutsRatio = (sum(TB + BB + SB + SF + SH + HBP + RBI)/sum(PA - H - BB + GIDP + CS + SH + SF))) %>%
+        group_by(playerID,yearID) %>%
+        mutate(TBC = (TB + BB + SB + SF + SH + HBP + RBI)) %>%
+        mutate(weightedOutsCreated = (PA - H - BB + GIDP + CS + SH + SF)*(leagueBasesToOutsRatio)) %>%
+        mutate(calculationYearAge = (yearID - birthYear)) %>%
+        mutate(ageadjustment = if_else(calculationYearAge > 29,((calculationYearAge-29) * -.003),((calculationYearAge-29) * .006)))%>%
+        mutate(netBasesCreated = (((TBC-weightedOutsCreated)/(1+ageadjustment))/ballParkFactor)) %>%
+        reframe(
+            playerID = playerID,
+            yearID = yearID,
+            birthYear = birthYear,
+            netBasesCreated = sum(netBasesCreated)
+        ) %>%
+        distinct()      
+
+    masterData
+
+}
+
+createOutputDataTemplate <- function(inputData, inputYear) {
+
+    ## outputdata dataframe will have each row consisting of a playerID, empty projectedBasesCreated slot  and player's birthYear
+
+    outputData <- inputData %>% 
+        filter(yearID == inputYear) %>%
+        group_by(playerID) %>%
+        ## filter to just the year we start the projection with
+        reframe(
+            playerID = playerID,
+            projectedBasesCreated = 0,
+            birthYear = birthYear
+        )
+
+    outputData
+    
+}
+
+calculateProjectedBasesCreated <- function(inputData, calculationStartYear, numberOfYearsToCalculate) {
+
+        outputData <- createOutputDataTemplate(inputData,calculationStartYear)
+        
+        counter = 1
+        ## counter is the scalar used to weight prior seasons
+
+        divisor = 0
+        ## the divisor is the sum of all the seasonal weighting
+
+        for (whichYearOfCalculation in 1:numberOfYearsToCalculate) {
+            ## this loop will calculate the projected bases created
+
+            divisor = divisor+counter 
+            ## the divisor is set up to be a linear weight for more recent seasons
+
+            additionalBasesCreated <- inputData %>% 
+                filter (yearID == (calculationStartYearCounter + whichYearOfCalculation - 1))%>%
+                group_by(playerID) %>%
+                select(playerID,netBasesCreated)
+            ## additionalBasesCreated dataframe has playerIDs and bases created for a single calculation year
+            outputData <- inner_join(outputData,additionalBasesCreated,by="playerID")
+            ## inner join the output df with the additional bases created df to get the subset which inlcudes previous year from output and this year from additional bases created
+            outputData <- outputData %>%
+                group_by(playerID) %>%
+                mutate(projectedBasesCreated = projectedBasesCreated + (counter*netBasesCreated)) %>%
+                select(playerID, projectedBasesCreated, birthYear)
+            ## increment the total projected bases by the calc year amount weighted for recency
+            ## strip extraneous netbasescreated column so it can be added again for the next calc year
+            counter = (counter + 1)
+        }
+        outputData <- outputData %>%
+            mutate(calculationYearAge = (calculationStartYearCounter - birthYear + howManyYears)) %>%
+            mutate(ageadjustment = if_else(calculationYearAge > 29,((calculationYearAge-29) * -.003),((calculationYearAge-29) * .006))) %>%
+            mutate(projectedBasesCreated = (projectedBasesCreated/divisor)*(1+ageadjustment)) %>%
+            select(playerID,projectedBasesCreated)
+
+        outputData
+
+}
+
+addActualBasesCreated <- function(inputData, outputSData, projectionYear) {
+
+     additionalBasesCreated <- inputData %>% 
+                filter (yearID == (projectionYear))%>%
+                group_by(playerID) %>%
+                select(playerID,netBasesCreated)
+
+    outputData <- inner_join(outputData,additionalBasesCreated,by="playerID")
+
+    outputData
+}
+
+
+createCorrelationTables<- function(inputData) {
+
+   
+    correlationTable <- data.frame(
+        startYear = 1995:2014
+    )
+
+    for (howManyYears in 2:5) {
+
+        newColumnName = paste0(howManyYears," years calculated")
+
+        correlationTable <- correlationTable %>%
+            mutate(!!newColumnName := 0)
+
+    }
+
+    for (howManyYears in 2:5) {
+
+        newColumnName = paste0(howManyYears," years calculated")
+
+        for (calculationStartYearCounter in 1995:2014) {
+
+            ## outputData <- calculateProjectedBases(inputData, calculationStartYearCounter, howManyYears)
+            ## new function to create outputData to have projected bases created for final year for each player
+
+            outputData <- inputData %>% 
+                ## output data comes from the input data data frame
+                filter(yearID == calculationStartYearCounter) %>%
+                group_by(playerID) %>%
+                ## filter to just the year we start the projection with
+                reframe(
+                    playerID = playerID,
+                    projectedBasesCreated = 0,
+                    birthYear = birthYear
+                )
+
+            counter = 1
+            ## counter is the scalar used to weight prior seasons
+
+            divisor = 0
+            ## the divisor is the sum of all the seasonal weighting
+
+            for (whichYearOfCalculation in 1:howManyYears) {
+                ## this loop will calculate the projected bases created
+                divisor = divisor+counter 
+                ## the divisor is set up to be a linear weight for more recent seasons
+                additionalBasesCreated <- inputData %>% 
+                    filter (yearID == (calculationStartYearCounter + whichYearOfCalculation - 1))%>%
+                    group_by(playerID) %>%
+                    select(playerID,netBasesCreated)
+                ## additionalBasesCreated dataframe has playerIDs and bases created for a single calculation year
+                outputData <- inner_join(outputData,additionalBasesCreated,by="playerID")
+                ## inner join the output df with the additional bases created df to get the subset which inlcudes previous year from output and this year from additional bases created
+                outputData <- outputData %>%
+                    group_by(playerID) %>%
+                    mutate(projectedBasesCreated = projectedBasesCreated + (counter*netBasesCreated)) %>%
+                    select(playerID, projectedBasesCreated, birthYear)
+                ## increment the total projected bases by the calc year amount weighted for recency
+                ## strip extraneous netbasescreated column so it can be added again for the next calc year
+                counter = (counter + 1)
+            }
+
+            ## additonalBasesCreated <- addActualBasesCreated(inputData, outputData, (calculationStartYearCounter + howManyYears))
+            ## new function to add actual bases created column to outputdata so outputdata has playerID, projectedBasesCreated and actual bases crreated for 
+            ## start year + number of years to use to build projection season for each player
+
+            additionalBasesCreated <- inputData %>% 
+                filter (yearID == (calculationStartYearCounter + howManyYears))%>%
+                group_by(playerID) %>%
+                select(playerID,netBasesCreated)
+
+            outputData <- inner_join(outputData,additionalBasesCreated,by="playerID")
+
+
+            outputData <- outputData %>%
+                mutate(actualBasesCreated = netBasesCreated) %>%
+                mutate(calculationYearAge = (calculationStartYearCounter - birthYear + howManyYears)) %>%
+                mutate(ageadjustment = if_else(calculationYearAge > 29,((calculationYearAge-29) * -.003),((calculationYearAge-29) * .006))) %>%
+                mutate(projectedBasesCreated = (projectedBasesCreated/divisor)*(1+ageadjustment)) %>%
+                select(playerID,projectedBasesCreated,actualBasesCreated)
+
+            correlationRowIndex <- which(correlationTable$startYear == calculationStartYearCounter)
+            correlationColumnIndex <-  match(newColumnName, colnames(correlationTable))
+
+            correlationTable[correlationRowIndex, correlationColumnIndex] <- cor(outputData$projectedBasesCreated,outputData$actualBasesCreated)
+            
+        
+        }
+
+    }
+
+    print(correlationTable)
+
+}
+
+
+##
+##
+##
+
+## old scraps
+
+ ## old code replaced by reformatMasterData function
+            outputData <- inputData %>% 
+                ## output data comes from the input data data frame
+                filter(yearID == calculationStartYearCounter) %>%
+                group_by(playerID) %>%
+                ## filter to just the year we start the projection with
+                reframe(
+                    playerID = playerID,
+                    projectedBasesCreated = 0,
+                    birthYear = birthYear
+                )
+
+
+            correlationTable <- correlationTable %>%
+                mutate(!!newColumnName = if_else(startYear == calculationStartYearCounter, cor(outputData$projectedBasesCreated,outputData$actualBasesCreated), !!newColumnName))
+
+        
+
+ outputData <- outputData %>%
+                mutate(projectedBasesCreated = projectedBasesCreated + (counter*additionalBasesCreated))
+ outputData <- outputData %>%
+            mutate(calculationYearAge = (calculationStartYear - birthYear + howManyYears)) %>%
+            mutate(ageadjustment = if_else(calculationYearAge > 29,((calculationYearAge-29) * -.003),((calculationYearAge-29) * .006))) %>%
+            mutate(projectedBasesCreated = (projectedBasesCreated/divisor)*(1+ageadjustment)) %>%
+            select(playerID,projectedBasesCreated,actualBasesCreated)
+
+        print(cor(outputData$actualBasesCreated,outputData$projectedBasesCreated))
+        print(outputData, n=5)
+
+
+
+
+oldCreateProjections<- function(inputData) {
+
+    startYear = 1995
+
+    howManyYears = 3
+
+    for (calculationStartYear in 1995:2018) {
+        outputData <- inputData %>% 
+            filter(yearID == calculationStartYear) %>%
+            reframe(
+                playerID = playerID,
+                birthYear = birthYear,
+                netBasesCreated1 = netBasesCreated,
+            )
+
+        for (whichYearOfCalculation in 1:howManyYears) {
+            newColumnName = paste0("netBasesCreated",(whichYearOfCalculation+1))
+            calculationData <- inputData %>% 
+                filter(yearID == (calculationStartYear + whichYearOfCalculation)) %>%
+                reframe(
+                    playerID = playerID,
+                    !!newColumnName := netBasesCreated
+                )
+            outputData <- inner_join(outputData,calculationData)
+            
+        }
+
+        names(outputData)[ncol(outputData)] <- "actualBasesCreated"
+
+        firstColumnNumber = (which(colnames(outputData) =="netBasesCreated1"))
+
+        lastColumnNumber = (ncol(outputData))
+
+        outputData <- outputData %>%
+            mutate(projectedBasesCreated = 0)
+    
+        counter = 1
+
+        divisor = 0
+
+        for (columnNumber in firstColumnNumber:(lastColumnNumber-1)) {
+            divisor = divisor + counter
+            outputData <- outputData %>%
+                mutate(projectedBasesCreated = projectedBasesCreated + (counter*(outputData[columnNumber][[1]])))
+            counter = (counter + 1)
+        }
+
+        outputData <- outputData %>%
+            mutate(calculationYearAge = (calculationStartYear - birthYear + howManyYears)) %>%
+            mutate(ageadjustment = if_else(calculationYearAge > 29,((calculationYearAge-29) * -.003),((calculationYearAge-29) * .006))) %>%
+            mutate(projectedBasesCreated = (projectedBasesCreated/divisor)*(1+ageadjustment)) %>%
+            select(playerID,projectedBasesCreated,actualBasesCreated)
+
+        print(cor(outputData$actualBasesCreated,outputData$projectedBasesCreated))
+        print(outputData, n=5)
+    }
+
+}
+
+calculateProjectedBases <- function(inputData) {
+
+    firstColumnNumber = (which(colnames(inputData) =="netBasesCreated1"))
+
+    ## this is dependent on the columns coming in in the right order which is a terrible assumption
+
+    lastColumnNumber = (ncol(inputData))
+
+    calculationData <- inputData %>%
+        mutate(actualBasesCreated = inputData[lastColumnNumber][[1]]) %>%
+        mutate(projectedBasesCreated = 0)
+    
+    counter = 1
+
+    divisor = 0
+
+    for (columnNumber in firstColumnNumber:(lastColumnNumber-1)) {
+        print(counter)
+        divisor = divisor + counter
+        calculationData <- calculationData %>%
+            mutate(projectedBasesCreated = projectedBasesCreated + (counter*(calculationData[columnNumber][[1]])))
+        counter = (counter + 1)
+    }
+
+    printData <- calculationData %>%
+        reframe(
+            playerID = playerID,
+            birthYear = birthYear,
+            actualBasesCreated = actualBasesCreated,
+            projectedBasesCreated = projectedBasesCreated)
+        
+    print(printData, n=3)
+
+    print(inputData, n=4)
+
+
+    10
+}
+
+createP<- function() {
+
+    startYear = 1995
+
+    howManyYears = 3
+
+    projectedFinalYearBasesCreated = 0
+
+    masterData <- createMasterData()
+
+    for (calculationStartYear in startYear:(startYear+1)) {
+        outputData <- masterData %>% 
+            filter(yearID == calculationStartYear) %>%
+            reframe(
+                playerID = playerID,
+                birthYear = birthYear,
+                netBasesCreated1 = netBasesCreated,
+            )
+
+        for (whichYearOfCalculation in 1:howManyYears) {
+            newColumnName = paste0("netBasesCreated",(whichYearOfCalculation+1))
+            calculationData <- masterData %>% 
+                filter(yearID == (calculationStartYear + whichYearOfCalculation)) %>%
+                reframe(
+                    playerID = playerID,
+                    !!newColumnName := netBasesCreated
+                )
+            outputData <- inner_join(outputData,calculationData, by="playerID") 
+        }
+
+    }
+
+}
+
+
+
+
+        for (whichYearOfCalculation in 1:howManyYears) {
+            newColumnName = paste0("netBasesCreated",(whichYearOfCalculation-1))
+            mutate()
+        }
+
+
+
+        outputData %>% 
+        mutate(calculationYearAge = (calculationStartYear - birthYear + 3)) %>%
+        mutate(ageadjustment = if_else(calculationYearAge > 29,((calculationYearAge-29) * -.003),((calculationYearAge-29) * .006))) %>%
+        mutate(projectedFinalYearBasesCreated = (((netBasesCreated0*1)+(netBasesCreated1*2)+(netBasesCreated2*3))/6)*(1+ageadjustment)) %>%
+        mutate(finalYearBasesCreated = netBasesCreated3) %>%
+
+
+threeYearProjections <- function() {
+
+    masterData <- createMasterData()
+
+    for (calculationStartYear in 1995:2018) {
+        calculationData <- masterData %>% filter(yearID == calculationStartYear)
+        for (whichYearOfCalculation in 1:3) {
+            calculationData <- inner_join(calculationData,masterData %>% filter(yearID == (calculationStartYear+whichYearOfCalculation)))
+        }
+        projectionOutput <- calculationData %>%
+        mutate(calculationYearAge = (calculationStartYear - birthYear + 3)) %>%
+        mutate(ageadjustment = if_else(calculationYearAge > 29,((calculationYearAge-29) * -.003),((calculationYearAge-29) * .006))) %>%
+        mutate(projectedFinalYearbasesCreated = (((netBasesCreated0*1)+(netBasesCreated1*2)+(netBasesCreated2*3))/6)*(1+ageadjustment)) %>%
+        mutate(finalYearBasesCreated = netBasesCreated3) %>%
+        select(playerID, projectedFinalYearbasesCreated, finalYearBasesCreated)
+
+        head(projectionOutput)
+
+        cor(projectionOutput$projectedFinalYearbasesCreated,projectionOutput$finalYearBasesCreated)
+    }
+}
+
+outputData2 <- outputData %>% reframe(
+            playerID = playerID,
+            birthYear = birthYear,
+            actualNetBasesCreated = netBasesCreated4
+        )
+
+                            
+    
+
+playerInfo <- (Lahman::People)
+
+##Load all the baseball data
+
+masterData <- inner_join(battingStats(data = Lahman::Batting,
+                            idvars = c("playerID", "yearID"),
+                            cbind = TRUE),playerInfo) %>%
+
+##Filter to 1995 and later
+
+filter(yearID > 1994) %>%
+
+# select the relevant stats
+
+filter(PA>1) %>%
+select(playerID, yearID, birthYear,TB, BB,SB,SH,RBI,HBP,PA,H,GIDP,CS,SF) %>%
+
+##Aggregate the multi team players
+
+group_by(playerID, yearID) %>%
+summarise(
+    birthYear = birthYear,
+    TB = sum(TB),
+    BB = sum(BB),
+    SB = sum(SB),
+    SH = sum(SH),
+    RBI = sum(RBI),
+    HBP=sum(HBP),
+    PA = sum(PA),
+    H = sum(H),
+    GIDP = sum(GIDP),
+    CS = sum(CS),
+    SF = sum(SF)
+) %>%
+distinct() 
+
+
+NBC<- function(inputData, startYear, whichCalculationYear) {
+
+    ## create a table for league data for the claculation year
+
+    calculationYear = startYear + whichCalculationYear
+
+    leagueData <- inputData%>%
+    filter(yearID==calculationYear) %>%
+    ungroup() %>%
+    summarise(
+        totalLeagueOuts = sum(PA - H - BB + GIDP + CS + SH + SF),
+        totalLeagueBasesCreated = sum(TB + BB + SB + SF + SH + HBP + RBI),
+        leagueBasesToOutsRatio = totalLeagueBasesCreated/totalLeagueOuts
+    ) 
+
+    ## calculate the data for each aggregated player for the calculation year
+
+    netBasesCreatedCalculationYear = sprintf("%s%0.0f", "netBasesCreated", whichCalculationYear)   
+
+    outputData <- inputData %>%
+    filter(yearID==calculationYear) %>%
+    group_by(playerID) %>%
+    mutate(TBC = (TB + BB + SB + SF + SH + HBP + RBI)) %>%
+    mutate(weightedOutsCreated = (PA - H - BB + GIDP + CS + SH + SF)*(leagueData$leagueBasesToOutsRatio)) %>%
+    mutate(calculationYearAge = (calculationYear - birthYear)) %>%
+    mutate(ageadjustment = if_else(calculationYearAge > 29,((calculationYearAge-29) * -.003),((calculationYearAge-29) * .006)))%>%
+    mutate(netBasesCreated = ((TBC-weightedOutsCreated)/(1+ageadjustment))) %>%
+    rename(!!netBasesCreatedCalculationYear := netBasesCreated) %>%
+    select(playerID, birthYear, all_of(netBasesCreatedCalculationYear))
+
+
+}
+
+masterNBC <- function(inputData, startYear, howManyYears) {
+
+    masterOutput <- NBC(inputData,startYear,0)
+    
+    for (whichCalculationYear in 1:howManyYears) {
+        
+            masterOutput <- inner_join(masterOutput,NBC(inputData, startYear,whichCalculationYear))
+        
+    } 
+
+    projectionOutput <- masterOutput %>%
+        mutate(calculationYearAge = (startYear - birthYear + howManyYears)) %>%
+        mutate(ageadjustment = if_else(calculationYearAge > 29,((calculationYearAge-29) * -.003),((calculationYearAge-29) * .006))) %>%
+        mutate(projectedFinalYearbasesCreated = (((netBasesCreated0*1)+(netBasesCreated1*2)+(netBasesCreated2*3))/6)*(1+ageadjustment)) %>%
+        mutate(finalYearBasesCreated = netBasesCreated3) %>%
+        select(playerID, projectedFinalYearbasesCreated, finalYearBasesCreated)
+
+    head(projectionOutput)
+
+    cor(projectionOutput$projectedFinalYearbasesCreated,projectionOutput$finalYearBasesCreated)
+
+}
+
+
+ projectionOutput <- masterOutput %>%
+        mutate(calculationYearAge = (startYear - birthYear + howManyYears)) %>%
+        mutate(ageadjustment = if_else(calculationYearAge > 29,((calculationYearAge-29) * -.003),((calculationYearAge-29) * .006))) %>%
+        mutate(projectedFinalYearbasesCreated = (((netBasesCreated0*1)+(netBasesCreated1*2)+(netBasesCreated3*3))/6)*(1+ageadjustment)) %>%
+        mutate(finalYearBasesCreated = netBasesCreated3) %>%
+        select(playerID, projectedFinalYearbasesCreated, finalYearBasesCreated)
+
+
+    masterOutput %>% mutate(calculationYearAge = startYear - birthYear + howManyYears + 1) %>%
+        mutate(ageadjustment = if_else(calculationYearAge > 29,((calculationYearAge-29) * -.003),((calculationYearAge-29) * .006)))%>%
+        mutate(projectedYear4basesCreated = (((netBasesCreated1*1)+(netBasesCreated2*2)+(netBasesCreated3*3))/6)*(1+ageadjustment))
+
+year1 = 1995
+
+firstFrame <- NBC(masterData,year1)
+
+secondFrame <- NBC(masterData,(year1 + 1))
+
+thirdFrame <- NBC(masterData,(year1 + 2))
+
+fourthFrame <- NBC(masterData,(year1 + 3))
